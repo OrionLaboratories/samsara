@@ -1,12 +1,23 @@
+import { ProxyAgent, fetch as undiciFetch } from "undici";
 import { SamsaraPaginatedResponse, SamsaraErrorResponse } from "./types.js";
 
 export class SamsaraClient {
   private baseUrl: string;
   private token: string;
+  private fetchFn: typeof globalThis.fetch;
 
   constructor(token: string, baseUrl = "https://api.samsara.com") {
     this.token = token;
     this.baseUrl = baseUrl.replace(/\/$/, "");
+
+    const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy || process.env.HTTP_PROXY || process.env.http_proxy;
+    if (proxyUrl) {
+      const dispatcher = new ProxyAgent(proxyUrl);
+      this.fetchFn = ((url: string | URL | Request, init?: RequestInit) =>
+        undiciFetch(url as any, { ...init as any, dispatcher })) as any;
+    } else {
+      this.fetchFn = globalThis.fetch;
+    }
   }
 
   private buildUrl(path: string, params?: Record<string, string | undefined>): string {
@@ -31,7 +42,7 @@ export class SamsaraClient {
       "Content-Type": "application/json",
     };
 
-    const response = await fetch(url, {
+    const response = await this.fetchFn(url, {
       method,
       headers,
       body: options?.body ? JSON.stringify(options.body) : undefined,
