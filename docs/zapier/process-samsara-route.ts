@@ -1,72 +1,77 @@
 /**
  * Optimized Zapier Code action: process a Samsara fleet route.
  *
- * Improvements over the previous version:
- *   - Uses `stop.address.id` from the route response, not name matching, so duplicate
- *     address names cannot cross-link stops to the wrong record.
- *   - Looks up existing form submissions through `/form-submissions/stream` with
- *     `assignedToRouteStopIds` + `formTemplateIds`. The previous version called
- *     `/form-submissions?routeStopId=...`, which is not a valid query parameter
- *     and always 400s.
- *   - Fetches each unique address once via `/addresses/{id}` instead of paging the
- *     entire org address book on every run.
- *   - Patches only `{ id, addressId, notes }` on changed stops, matching the
- *     `UpdateRoutesStopRequestObjectRequestBody` schema. The previous version
- *     spread the GET response back into a JSON Merge Patch, which sent
- *     unsupported fields (`forms`, `state`, `actualArrivalTime`, `address`, ...)
- *     and dropped `addressId`.
- *   - Removes the JSON marker lines in `route.notes`. The route notes field is
- *     capped at 2000 characters; the live form-submission lookup is now the
- *     source of truth for idempotency, so markers are unnecessary.
- *   - Throttles to stay under the documented 100 requests/min limit on
- *     `POST /form-submissions` and `PATCH /fleet/routes/{id}`.
- *   - Treats `lockboxFormTemplateId` and `sampleFormTemplateId` as required
- *     inputs. They are org-specific UUIDs and have no safe global default.
- *   - Lockbox tag matching accepts an optional id (numeric, org-specific) and a
- *     case-insensitive name (default `"Lockbox"`); either can match.
+ * For a given routeId this action:
+ *   1. Fetches the route, then loads each stop's linked Samsara address (and
+ *      the address's tags) via `GET /addresses/{id}`.
+ *   2. Copies the address's `notes` onto the stop's `notes` (capped at the
+ *      2000-character API limit) when the stop's notes do not already
+ *      contain that text.
+ *   3. Assigns specimen-pickup form submissions to middle stops, driven by
+ *      a tag-to-form rule list. Every rule whose tag matches the stop's
+ *      linked address contributes a form submission.
+ *   4. Assigns a specimen-delivery form submission to the final stop AND to
+ *      any non-first stop whose address carries a depot tag.
+ *
+ * Idempotency is enforced by a single bulk lookup against
+ * `GET /form-submissions/stream` (filtered by `assignedToRouteStopIds` and
+ * `formTemplateIds`); existing submissions are not re-created.
+ *
+ * The route is patched once with `{ stops: [{ id, addressId, notes }, ...] }`
+ * for stops whose notes changed. No marker lines are written into the route's
+ * `notes` field.
  */
+
+interface PickupFormRule {
+  /** Case-insensitive tag name or numeric Samsara tag id. */
+  tag: string;
+  /** Form template id to assign when a middle stop's address carries `tag`. */
+  formTemplateId: string;
+}
 
 interface ProcessSamsaraRouteInput {
   routeId: string;
-  lockboxFormTemplateId: string;
-  sampleFormTemplateId: string;
-  lockboxTagId?: string;
-  lockboxTagName?: string;
+  /** Tag-to-form rules. A stop receives every form whose tag matches. */
+  pickupFormRules: PickupFormRule[];
+  /** Form template id used for the delivery form. */
+  deliveryFormTemplateId: string;
+  /** Tag names or ids that mark an address as a depot. Default: ["Depot"]. */
+  depotTags?: string[];
+  /** Lookback (days) when scanning existing submissions. Default: 30. */
   formLookupLookbackDays?: number;
+  /** Delay between mutating requests. Default 700 ms (~85/min, under 100/min). */
   interRequestDelayMs?: number;
 }
 
-type FormStatus =
-  | "notAttempted"
-  | "notApplicable"
-  | "missingStopId"
-  | "missingAddress"
-  | "addressFetchError"
-  | "notRequired"
-  | "existing"
-  | "created"
-  | "error";
+type FormStatus = "created" | "existing" | "error";
+type DeliveryStatus = FormStatus | "notRequired" | "notAttempted";
+
+interface AssignedPickupForm {
+  tag: string;
+  formTemplateId: string;
+  status: FormStatus;
+}
 
 interface StopDetail {
   stopId: string;
   name: string;
-  isMiddleStop: boolean;
-  skipReason: string | null;
+  position: "start" | "middle" | "end";
   addressId: string | null;
   matchedAddressName: string | null;
   tags: string[];
+  isDepot: boolean;
   notesUpdated: boolean;
-  lockboxFormStatus: FormStatus;
-  sampleFormStatus: FormStatus;
+  pickupFormsAssigned: AssignedPickupForm[];
+  deliveryFormStatus: DeliveryStatus;
+  skipReason: string | null;
 }
 
 interface ProcessSamsaraRouteResult {
   routeId: string;
   totalStops: number;
-  middleStops: number;
   notesUpdated: number;
-  lockboxFormsCreated: number;
-  sampleFormsCreated: number;
+  pickupFormsCreated: number;
+  deliveryFormsCreated: number;
   formsAlreadyPresent: number;
   errors: string[];
   stopDetails: StopDetail[];
@@ -81,23 +86,24 @@ export async function processSamsaraRoute(
 ): Promise<ProcessSamsaraRouteResult> {
   const {
     routeId,
-    lockboxFormTemplateId,
-    sampleFormTemplateId,
-    lockboxTagId,
-    lockboxTagName = "Lockbox",
+    pickupFormRules,
+    deliveryFormTemplateId,
+    depotTags = ["Depot"],
     formLookupLookbackDays = 30,
     interRequestDelayMs = 700,
   } = input;
 
   if (!routeId) throw new Error("routeId is required");
-  if (!lockboxFormTemplateId) throw new Error("lockboxFormTemplateId is required");
-  if (!sampleFormTemplateId) throw new Error("sampleFormTemplateId is required");
+  if (!deliveryFormTemplateId) throw new Error("deliveryFormTemplateId is required");
+  if (!Array.isArray(pickupFormRules)) {
+    throw new Error("pickupFormRules must be an array");
+  }
 
   const errors: string[] = [];
   const stopDetails: StopDetail[] = [];
   let notesUpdated = 0;
-  let lockboxFormsCreated = 0;
-  let sampleFormsCreated = 0;
+  let pickupFormsCreated = 0;
+  let deliveryFormsCreated = 0;
   let formsAlreadyPresent = 0;
 
   // 1. Fetch the route.
@@ -114,91 +120,80 @@ export async function processSamsaraRoute(
     return summary();
   }
 
-  const totalStops = stops.length;
-  if (totalStops < 3) {
-    for (const s of stops) stopDetails.push(buildDetail(s, false, "terminalStop"));
+  if (stops.length === 0) {
+    errors.push("No stops found on route");
     return summary();
   }
 
-  // 2. Identify middle stops with valid IDs.
-  const middleStops = stops.slice(1, -1);
-  const middleStopIds = middleStops
-    .map((s) => (s?.id ? String(s.id) : ""))
-    .filter(Boolean);
+  const stopIds = stops.map((s) => idOf(s)).filter(Boolean);
+  const uniqueAddressIds = unique(
+    stops.map((s) => idOf(s?.address)).filter(Boolean)
+  );
 
-  // 3. Bulk-load existing submissions for both templates across all middle stops.
+  // 2. Bulk-load existing submissions for every template referenced in the rules
+  //    plus the delivery template, scoped to this route's stops.
+  const allTemplateIds = unique([
+    deliveryFormTemplateId,
+    ...pickupFormRules.map((r) => r.formTemplateId),
+  ]);
   const existingFormsByStop = await loadExistingForms(
-    middleStopIds,
-    [lockboxFormTemplateId, sampleFormTemplateId],
+    stopIds,
+    allTemplateIds,
     formLookupLookbackDays,
     errors
   );
 
-  // 4. Fetch each unique address once (parallel).
-  const uniqueAddressIds = unique(
-    middleStops
-      .map((s) => (s?.address?.id ? String(s.address.id) : ""))
-      .filter(Boolean)
-  );
+  // 3. Fetch each unique address once (parallel) — this is where tags and
+  //    notes come from.
   const addressById = await loadAddresses(uniqueAddressIds, errors);
 
-  // 5. Walk every stop in order so output ordering is stable.
+  // 4. Walk every stop in order and decide what work it needs.
   const stopPatches: Array<{ id: string; addressId: string; notes: string }> = [];
+  const lastIndex = stops.length - 1;
 
   for (let i = 0; i < stops.length; i++) {
     const stop = stops[i];
-    const isMiddle = i > 0 && i < stops.length - 1;
-
-    if (!isMiddle) {
-      stopDetails.push(buildDetail(stop, false, "terminalStop"));
-      continue;
-    }
-
-    const detail = buildDetail(stop, true, null);
+    const position: StopDetail["position"] =
+      i === 0 ? "start" : i === lastIndex ? "end" : "middle";
+    const detail = buildDetail(stop, position);
 
     if (!detail.stopId) {
       detail.skipReason = "missingStopId";
-      detail.lockboxFormStatus = "missingStopId";
-      detail.sampleFormStatus = "missingStopId";
       stopDetails.push(detail);
       continue;
     }
 
     if (!detail.addressId) {
       detail.skipReason = "missingAddress";
-      detail.lockboxFormStatus = "missingAddress";
-      detail.sampleFormStatus = "missingAddress";
       stopDetails.push(detail);
       continue;
     }
 
     const address = addressById.get(detail.addressId);
     if (!address) {
-      detail.lockboxFormStatus = "addressFetchError";
-      detail.sampleFormStatus = "addressFetchError";
+      detail.skipReason = "addressFetchError";
       stopDetails.push(detail);
       continue;
     }
 
-    detail.matchedAddressName = address?.name ?? null;
+    detail.matchedAddressName = address?.name ?? detail.matchedAddressName;
     detail.tags = (Array.isArray(address?.tags) ? address.tags : [])
       .map((t: any) => t?.name || t?.id)
       .filter(Boolean)
       .map(String);
+    detail.isDepot = addressMatchesAnyTag(address, depotTags);
 
-    // 5a. Notes: append address notes to the stop if missing, capped at 2000 chars.
+    // 4a. Notes: append the address's notes to the stop's notes when missing.
     const addressNotes = String(address?.notes ?? "").trim();
     const existingNotes = String(stop?.notes ?? "");
     if (addressNotes && !existingNotes.includes(addressNotes)) {
       const merged = existingNotes
         ? `${existingNotes}\n\n${addressNotes}`
         : addressNotes;
-      const truncated =
-        merged.length > STOP_NOTES_MAX ? merged.slice(0, STOP_NOTES_MAX) : merged;
       stopPatches.push({
         id: detail.stopId,
         addressId: detail.addressId,
-        notes: truncated,
+        notes: merged.slice(0, STOP_NOTES_MAX),
       });
       detail.notesUpdated = true;
       notesUpdated++;
@@ -206,45 +201,74 @@ export async function processSamsaraRoute(
 
     const existing = existingFormsByStop.get(detail.stopId) ?? new Set<string>();
 
-    // 5b. Lockbox form (only when the linked address carries the lockbox tag).
-    if (!hasLockboxTag(address, lockboxTagId, lockboxTagName)) {
-      detail.lockboxFormStatus = "notRequired";
-    } else if (existing.has(lockboxFormTemplateId)) {
-      detail.lockboxFormStatus = "existing";
-      formsAlreadyPresent++;
-    } else {
-      const ok = await createFormSubmission({
-        stopId: detail.stopId,
-        templateId: lockboxFormTemplateId,
-        title: `Lockbox Form - ${detail.name}`.slice(0, TITLE_MAX),
-        isRequired: true,
-      });
-      if (ok) {
-        detail.lockboxFormStatus = "created";
-        existing.add(lockboxFormTemplateId);
-        lockboxFormsCreated++;
-      } else {
-        detail.lockboxFormStatus = "error";
+    // 4b. Pickup forms: middle stops only, one per matching rule.
+    if (position === "middle" && pickupFormRules.length > 0) {
+      const matchedRules = pickupFormRules.filter((rule) =>
+        addressMatchesTag(address, rule.tag)
+      );
+      // De-duplicate by template id while remembering which tag triggered each.
+      const seen = new Set<string>();
+      for (const rule of matchedRules) {
+        if (seen.has(rule.formTemplateId)) continue;
+        seen.add(rule.formTemplateId);
+
+        if (existing.has(rule.formTemplateId)) {
+          detail.pickupFormsAssigned.push({
+            tag: rule.tag,
+            formTemplateId: rule.formTemplateId,
+            status: "existing",
+          });
+          formsAlreadyPresent++;
+          continue;
+        }
+
+        const ok = await createFormSubmission({
+          stopId: detail.stopId,
+          templateId: rule.formTemplateId,
+          title: `Specimen Pickup - ${detail.name}`.slice(0, TITLE_MAX),
+          isRequired: true,
+        });
+        if (ok) {
+          detail.pickupFormsAssigned.push({
+            tag: rule.tag,
+            formTemplateId: rule.formTemplateId,
+            status: "created",
+          });
+          existing.add(rule.formTemplateId);
+          pickupFormsCreated++;
+        } else {
+          detail.pickupFormsAssigned.push({
+            tag: rule.tag,
+            formTemplateId: rule.formTemplateId,
+            status: "error",
+          });
+        }
+        await sleep(interRequestDelayMs);
       }
-      await sleep(interRequestDelayMs);
     }
 
-    // 5c. Sample form (every matched middle stop).
-    if (existing.has(sampleFormTemplateId)) {
-      detail.sampleFormStatus = "existing";
+    // 4c. Delivery form: end stop, or any non-start stop tagged as depot.
+    const deliveryRequired =
+      position === "end" || (position !== "start" && detail.isDepot);
+
+    if (!deliveryRequired) {
+      detail.deliveryFormStatus = "notRequired";
+    } else if (existing.has(deliveryFormTemplateId)) {
+      detail.deliveryFormStatus = "existing";
       formsAlreadyPresent++;
     } else {
       const ok = await createFormSubmission({
         stopId: detail.stopId,
-        templateId: sampleFormTemplateId,
+        templateId: deliveryFormTemplateId,
+        title: `Specimen Delivery - ${detail.name}`.slice(0, TITLE_MAX),
         isRequired: true,
       });
       if (ok) {
-        detail.sampleFormStatus = "created";
-        existing.add(sampleFormTemplateId);
-        sampleFormsCreated++;
+        detail.deliveryFormStatus = "created";
+        existing.add(deliveryFormTemplateId);
+        deliveryFormsCreated++;
       } else {
-        detail.sampleFormStatus = "error";
+        detail.deliveryFormStatus = "error";
       }
       await sleep(interRequestDelayMs);
     }
@@ -253,7 +277,7 @@ export async function processSamsaraRoute(
     stopDetails.push(detail);
   }
 
-  // 6. Patch the route once with the modified stop notes (only changed stops).
+  // 5. Patch the route once with the modified stop notes.
   if (stopPatches.length > 0) {
     try {
       const res = await fetchWithZapier(
@@ -278,10 +302,9 @@ export async function processSamsaraRoute(
     return {
       routeId,
       totalStops: stops.length,
-      middleStops: middleStops?.length ?? 0,
       notesUpdated,
-      lockboxFormsCreated,
-      sampleFormsCreated,
+      pickupFormsCreated,
+      deliveryFormsCreated,
       formsAlreadyPresent,
       errors,
       stopDetails,
@@ -312,7 +335,7 @@ export async function processSamsaraRoute(
       return true;
     } catch (e: any) {
       errors.push(
-        `Failed to create form submission (template ${args.templateId}) for stop ${args.stopId}: ${describe(e)}`
+        `Failed to create form (template ${args.templateId}) for stop ${args.stopId}: ${describe(e)}`
       );
       return false;
     }
@@ -321,39 +344,36 @@ export async function processSamsaraRoute(
 
 // -- module-scope helpers --
 
-function buildDetail(
-  stop: any,
-  isMiddle: boolean,
-  skipReason: string | null
-): StopDetail {
+function buildDetail(stop: any, position: StopDetail["position"]): StopDetail {
   return {
-    stopId: stop?.id ? String(stop.id) : "",
+    stopId: idOf(stop),
     name: stop?.name ?? "",
-    isMiddleStop: isMiddle,
-    skipReason,
-    addressId: stop?.address?.id ? String(stop.address.id) : null,
+    position,
+    addressId: idOf(stop?.address) || null,
     matchedAddressName: stop?.address?.name ?? null,
     tags: [],
+    isDepot: false,
     notesUpdated: false,
-    lockboxFormStatus: isMiddle ? "notAttempted" : "notApplicable",
-    sampleFormStatus: isMiddle ? "notAttempted" : "notApplicable",
+    pickupFormsAssigned: [],
+    deliveryFormStatus: "notAttempted",
+    skipReason: null,
   };
 }
 
-function hasLockboxTag(
-  address: any,
-  lockboxTagId: string | undefined,
-  lockboxTagName: string
-): boolean {
+function addressMatchesTag(address: any, tag: string): boolean {
+  const target = String(tag ?? "").trim();
+  if (!target) return false;
+  const targetLower = target.toLowerCase();
   const tags: any[] = Array.isArray(address?.tags) ? address.tags : [];
-  const targetName = lockboxTagName.trim().toLowerCase();
   return tags.some((t) => {
-    const idMatch =
-      lockboxTagId && t?.id && String(t.id) === String(lockboxTagId);
-    const nameMatch =
-      targetName && t?.name && String(t.name).trim().toLowerCase() === targetName;
-    return Boolean(idMatch || nameMatch);
+    const id = t?.id ? String(t.id) : "";
+    const name = t?.name ? String(t.name).trim().toLowerCase() : "";
+    return id === target || (name !== "" && name === targetLower);
   });
+}
+
+function addressMatchesAnyTag(address: any, tags: string[]): boolean {
+  return tags.some((t) => addressMatchesTag(address, t));
 }
 
 async function loadExistingForms(
@@ -370,15 +390,15 @@ async function loadExistingForms(
   ).toISOString();
 
   // Both filters cap at 50 IDs per request.
-  for (const stops of chunk(stopIds, 50)) {
-    for (const templates of chunk(templateIds, 50)) {
+  for (const stopChunk of chunk(stopIds, 50)) {
+    for (const templateChunk of chunk(templateIds, 50)) {
       let cursor = "";
       let hasNext = true;
       while (hasNext) {
         const params = new URLSearchParams({
           startTime,
-          assignedToRouteStopIds: stops.join(","),
-          formTemplateIds: templates.join(","),
+          assignedToRouteStopIds: stopChunk.join(","),
+          formTemplateIds: templateChunk.join(","),
         });
         if (cursor) params.set("after", cursor);
 
@@ -432,6 +452,10 @@ async function loadAddresses(
     })
   );
   return out;
+}
+
+function idOf(obj: any): string {
+  return obj?.id ? String(obj.id) : "";
 }
 
 function unique(values: string[]): string[] {
